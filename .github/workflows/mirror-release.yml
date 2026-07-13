@@ -1,0 +1,79 @@
+name: Mirror latest release
+
+# 每天从源 Fork (GrahamZen/animeko) 拉取最新 Release 并原样发布到本仓库.
+# 本仓库只做分发, 不含源代码.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 每天 UTC 06:00 (北京时间 14:00) 同步一次
+  workflow_dispatch:       # 也可在 Actions 页面手动触发
+
+permissions:
+  contents: write          # 需要写权限以在本仓库创建 Release
+
+concurrency:
+  group: mirror-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: GrahamZen/animeko
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror latest release from source fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # 取源仓库最新一个 Release (releases API 按创建时间倒序, .[0] 即最新, 含 prerelease;
+          # 草稿 draft 对无 push 权限的 token 不可见, 天然被排除).
+          latest_json="$(gh api "repos/${SOURCE_REPO}/releases" --jq '.[0]')"
+          if [ -z "$latest_json" ] || [ "$latest_json" = "null" ]; then
+            echo "源仓库暂无 Release, 跳过."
+            exit 0
+          fi
+
+          tag="$(echo "$latest_json" | jq -r '.tag_name')"
+          name="$(echo "$latest_json" | jq -r '.name // .tag_name')"
+          prerelease="$(echo "$latest_json" | jq -r '.prerelease')"
+          echo "源仓库最新 Release: tag=$tag  name=$name  prerelease=$prerelease"
+
+          # 幂等: 本仓库已镜像过同名 tag 则跳过, 避免重复发布.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "本仓库已存在 $tag, 无需同步."
+            exit 0
+          fi
+
+          # 下载源 Release 的全部资源.
+          mkdir -p dist
+          gh release download "$tag" --repo "$SOURCE_REPO" --dir dist --clobber
+          echo "已下载资源:"
+          ls -la dist
+
+          if [ -z "$(ls -A dist 2>/dev/null)" ]; then
+            echo "源 Release 没有可下载的资源, 跳过."
+            exit 0
+          fi
+
+          # 复用源 Release 的说明, 并在开头注明这是自动镜像.
+          {
+            echo "> 本 Release 由 [GrahamZen/animeko](https://github.com/${SOURCE_REPO}/releases/tag/${tag}) 自动镜像。"
+            echo
+            echo "$latest_json" | jq -r '.body // ""'
+          } > notes.md
+
+          flags=()
+          if [ "$prerelease" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$name" \
+            --notes-file notes.md \
+            "${flags[@]}"
+
+          echo "已发布 $tag 到 $GITHUB_REPOSITORY"
