@@ -1,15 +1,18 @@
-name: Mirror latest release
+name: Mirror releases
 
-# 每天从源 Fork (GrahamZen/animeko) 拉取最新 Release 并原样发布到本仓库.
+# 每天从源 Fork (GrahamZen/animeko) 同步 *全部* Release 到本仓库.
+# - 缺失的 tag 会被镜像;
+# - 源上内容有变化 (如删除后用同一 tag 重新发布) 会重新镜像;
+# - 未变化的 tag 跳过.
 # 本仓库只做分发, 不含源代码.
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 每天 UTC 06:00 (北京时间 14:00) 同步一次
+    - cron: '0 0 * * *'   # 每天 UTC 00:00 (北京时间 08:00) 同步一次
   workflow_dispatch:       # 也可在 Actions 页面手动触发
 
 permissions:
-  contents: write          # 需要写权限以在本仓库创建 Release
+  contents: write          # 需要写权限以在本仓库创建 / 更新 Release
 
 concurrency:
   group: mirror-release
@@ -22,58 +25,80 @@ jobs:
   mirror:
     runs-on: ubuntu-latest
     steps:
-      - name: Mirror latest release from source fork
+      - name: Mirror all releases from source fork
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          # 取源仓库最新一个 Release (releases API 按创建时间倒序, .[0] 即最新, 含 prerelease;
-          # 草稿 draft 对无 push 权限的 token 不可见, 天然被排除).
-          latest_json="$(gh api "repos/${SOURCE_REPO}/releases" --jq '.[0]')"
-          if [ -z "$latest_json" ] || [ "$latest_json" = "null" ]; then
-            echo "源仓库暂无 Release, 跳过."
+          # 源仓库全部 Release 的 tag (含 prerelease; draft 对无 push 权限的 token 不可见, 天然排除).
+          # tac 反转成从旧到新, 让本仓库的发布顺序更自然.
+          mapfile -t tags < <(gh api "repos/${SOURCE_REPO}/releases" --paginate --jq '.[].tag_name' | tac)
+
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "源仓库暂无 Release, 结束."
             exit 0
           fi
+          echo "源仓库共 ${#tags[@]} 个 Release: ${tags[*]}"
 
-          tag="$(echo "$latest_json" | jq -r '.tag_name')"
-          name="$(echo "$latest_json" | jq -r '.name // .tag_name')"
-          prerelease="$(echo "$latest_json" | jq -r '.prerelease')"
-          echo "源仓库最新 Release: tag=$tag  name=$name  prerelease=$prerelease"
+          asset_sig() {  # 从一段 release JSON 提取 "名字:大小" 指纹, 排序后拼接, 用于判断资源是否一致
+            jq -r '[.assets[] | "\(.name):\(.size)"] | sort | join(",")'
+          }
 
-          # 幂等: 本仓库已镜像过同名 tag 则跳过, 避免重复发布.
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "本仓库已存在 $tag, 无需同步."
-            exit 0
-          fi
+          for tag in "${tags[@]}"; do
+            rel="$(gh api "repos/${SOURCE_REPO}/releases/tags/${tag}")"
+            name="$(jq -r '.name // .tag_name' <<<"$rel")"
+            prerelease="$(jq -r '.prerelease' <<<"$rel")"
+            src_updated="$(jq -r '.updated_at' <<<"$rel")"   # 源 release 最后修改时间, 作为变化标记
+            src_sig="$(asset_sig <<<"$rel")"
 
-          # 下载源 Release 的全部资源.
-          mkdir -p dist
-          gh release download "$tag" --repo "$SOURCE_REPO" --dir dist --clobber
-          echo "已下载资源:"
-          ls -la dist
+            action="create"
+            if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+              tgt="$(gh release view "$tag" --repo "$REPO" --json body,assets)"
+              # 本仓库镜像时会把源的 updated_at 藏进说明里, 读回来对比
+              marker="$(jq -r '.body' <<<"$tgt" | sed -n 's/.*mirror-src-updated:\([^ >]*\).*/\1/p' | head -n1)"
+              tgt_sig="$(asset_sig <<<"$tgt")"
+              if [ -n "$marker" ]; then
+                if [ "$marker" = "$src_updated" ]; then action="skip"; else action="remirror"; fi
+              else
+                # 旧的 (无标记) 镜像: 仅当资源不同才重新镜像, 避免无谓重传
+                if [ "$tgt_sig" = "$src_sig" ]; then action="skip"; else action="remirror"; fi
+              fi
+            fi
 
-          if [ -z "$(ls -A dist 2>/dev/null)" ]; then
-            echo "源 Release 没有可下载的资源, 跳过."
-            exit 0
-          fi
+            echo "==> [$tag] $action (src_updated=$src_updated)"
+            [ "$action" = "skip" ] && continue
 
-          # 复用源 Release 的说明, 并在开头注明这是自动镜像.
-          {
-            echo "> 本 Release 由 [GrahamZen/animeko](https://github.com/${SOURCE_REPO}/releases/tag/${tag}) 自动镜像。"
-            echo
-            echo "$latest_json" | jq -r '.body // ""'
-          } > notes.md
+            if [ "$action" = "remirror" ]; then
+              # 先删掉旧的 release 和 tag, 再重新创建, 确保资源和说明都刷新
+              gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag
+            fi
 
-          flags=()
-          if [ "$prerelease" = "true" ]; then
-            flags+=(--prerelease)
-          fi
+            rm -rf dist && mkdir -p dist
+            gh release download "$tag" --repo "$SOURCE_REPO" --dir dist --clobber || true
+            if [ -z "$(ls -A dist 2>/dev/null)" ]; then
+              echo "    源 Release 无资源, 跳过."
+              continue
+            fi
 
-          gh release create "$tag" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$name" \
-            --notes-file notes.md \
-            "${flags[@]}"
+            {
+              echo "> 本 Release 由 [GrahamZen/animeko](https://github.com/${SOURCE_REPO}/releases/tag/${tag}) 自动镜像。"
+              echo
+              jq -r '.body // ""' <<<"$rel"
+              echo
+              echo "<!-- mirror-src-updated:${src_updated} -->"
+            } > notes.md
 
-          echo "已发布 $tag 到 $GITHUB_REPOSITORY"
+            flags=()
+            [ "$prerelease" = "true" ] && flags+=(--prerelease)
+
+            gh release create "$tag" dist/* \
+              --repo "$REPO" \
+              --title "$name" \
+              --notes-file notes.md \
+              "${flags[@]}"
+            echo "    已发布 $tag"
+          done
+
+          echo "同步完成."
